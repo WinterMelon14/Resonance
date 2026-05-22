@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from argparse import ArgumentParser
 from pathlib import Path
-
-from music21 import converter, midi
+import pygame
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 DEFAULT_OUTPUT_DIR = BASE_DIR / "data" / "output"
@@ -27,9 +26,14 @@ def main() -> None:
         return
 
     print(f"Playing: {path.name}")
-    score = converter.parse(str(path))
-    sp = midi.realtime.StreamPlayer(score)
-    sp.play()
+    pygame.init()
+    pygame.mixer.init()
+    pygame.mixer.music.load(str(path))
+    pygame.mixer.music.play()
+
+    # Block until playback finishes
+    while pygame.mixer.music.get_busy():
+        pygame.time.wait(100)
 
 
 if __name__ == "__main__":
