@@ -62,7 +62,6 @@ class HarmonicStacking(nn.Module):
         return x
 
 
-
 # Generic little conv with some bn and gelu
 class ConvBlock(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, kernel: int = 3):
@@ -159,6 +158,7 @@ class PitchOnlyPositionalEmbedding(nn.Module):
 
 # Axial attention helps the model learn relationships betwen pitches, which is important because piano music uses chords heavily
 # If C and E are being played, the model will take a closer look at G and ignore noise at other spots like F#
+# I want to try adding Time Attention as well and replacing the dilations later. We might need to use localized attention (maybe +-64 frames) since 384 is a lot
 class AxialAttentionBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float):
         super().__init__()
@@ -178,6 +178,55 @@ class AxialAttentionBlock(nn.Module):
         return x
 
 
+# Try a GRU here
+class PitchwiseBiGRU(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_layers: int = 1,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+
+        if d_model % 2 != 0:
+            raise ValueError("d_model must be even for this BiGRU")
+
+        # Each direction produces d_model // 2 features.
+        # Concatenating forward and backward gives d_model again.
+        self.gru = nn.GRU(
+            input_size=d_model,
+            hidden_size=d_model // 2,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, T, P)
+        B, C, T, P = x.shape
+
+        # Give each pitch its own temporal sequence.
+        h = x.permute(0, 3, 2, 1).contiguous()
+        # h: (B, P, T, C)
+
+        h = h.reshape(B * P, T, C)
+        # h: (B*P, T, C)
+
+        temporal, _ = self.gru(h)
+        # temporal: (B*P, T, C)
+
+        # Residual refinement rather than complete replacement.
+        h = self.norm(h + self.dropout(temporal))
+
+        h = h.reshape(B, P, T, C)
+        h = h.permute(0, 3, 2, 1).contiguous()
+
+        # (B, C, T, P)
+        return h
 # Separate conv block used in the detection heads. It is stronger than a normal conv block because it uses depthwise separable convolutions
 class SepConvBlock(nn.Module):
     def __init__(self, channels, kernel_size=(7, 7), padding=(3, 3)):
@@ -225,7 +274,6 @@ class TemporalResidualBlock(nn.Module):
     def forward(self, x):
         return x + self.net(x)
 
-
 # Main model
 class PianoTranscriber(nn.Module):
     def __init__(
@@ -235,7 +283,7 @@ class PianoTranscriber(nn.Module):
         cfg: ExperimentConfig = CFG,
     ):
         super().__init__()
-        n_bins = cfg.feature.n_bins if n_bins is None else n_bins
+        n_bins = cfg.feature.input_bins if n_bins is None else n_bins
         d_model = cfg.model.d_model if d_model is None else d_model
 
 
@@ -249,10 +297,13 @@ class PianoTranscriber(nn.Module):
         self.trunk_pre = nn.Sequential(
             ConvBlock(8, 32, kernel=5),
             ConvBlock(32, 64, kernel=3),
+            # I may consider adding a 1x1 conv here as well
+            # Or maybe start with a 1x1 and use a residual to learn harmonic relationships
         )
 
         # Reduce the frequency axis from 264 bins to 88 bins using a local convolution with stride over frequency. This is important because the model doesn't need to see all 264 bins, and reducing the frequency axis helps the model train faster. 
         # There's 88 keys on the piano so we collapse these CQT bins into 88 keys
+        # Depthwise Separable is so much cheaper than a full conv here
         self.freq_reduce = nn.Sequential(
             nn.Conv2d(64, 64, kernel_size=(1, 7), stride=(1, 3), padding=(0, 3), groups=64, bias=False), 
             nn.Conv2d(64, 64, kernel_size=1, bias=False),
@@ -264,14 +315,27 @@ class PianoTranscriber(nn.Module):
         self.trunk_post = nn.Sequential(
             ConvBlock(64, d_model, kernel=3),
         )
-
+        
         self.attn = AxialAttentionBlock(d_model, n_heads=cfg.model.n_heads, dropout=cfg.model.dropout)
+        self.gru = PitchwiseBiGRU(
+            d_model=d_model,
+            num_layers=1,
+            dropout=cfg.model.dropout,
+        )
+
+        # Pool across pitch after the BiGRU and predict one sustain-pedal state per frame.
+        self.pedal_head = nn.Sequential(
+            nn.Conv1d(d_model, d_model // 2, kernel_size=7, padding=3, bias=False),
+            nn.BatchNorm1d(d_model // 2),
+            nn.GELU(),
+            nn.Conv1d(d_model // 2, 1, kernel_size=1),
+        )
 
         # This conv creates an initial frame activity prediction.
         # It'll end up with a (B, 1, T, 88) shape. The channel dim gets squished to 1 because at each pitch we predict if its active
         self.note_conv = nn.Sequential(
             SepConvBlock(d_model, kernel_size=(7, 7), padding=(3, 3)),
-            nn.Conv2d(d_model, 1, kernel_size=(7, 3), padding=(3, 1)),
+            nn.Conv2d(d_model, 1, kernel_size=(7, 3), padding=(3, 1)), # 1 channel. 1 value. Not to be confused with the 1x1 kernel we use in the depthwise separable conv right before it.
         )
 
         # Simple bunch of convs for onsets and offests
@@ -285,7 +349,7 @@ class PianoTranscriber(nn.Module):
         )
     
         self.offset_conv = nn.Sequential(
-            nn.Conv2d(d_model + 1, d_model, kernel_size=1, bias=False),
+            nn.Conv2d(d_model + 2, d_model, kernel_size=1, bias=False),
             nn.BatchNorm2d(d_model),
             nn.GELU(),
             SepConvBlock(d_model, kernel_size=(3, 3), padding=(1, 1)),
@@ -294,19 +358,12 @@ class PianoTranscriber(nn.Module):
 
         # Mix channels to go back to d_model at every (T, 88) location. 
         self.frame_refine_input = nn.Sequential(
-            nn.Conv2d(d_model + 3, d_model, kernel_size=1, bias=False),
+            nn.Conv2d(d_model + 4, d_model, kernel_size=1, bias=False),
             nn.BatchNorm2d(d_model),
             nn.GELU(),
         )
         
-        # Look across time to handle notes held for a long time and handle the sus pedal.
-        # Multiple stacks here let us look at a wide window without too much computation
-        self.frame_refine_temporal = nn.Sequential(
-            *[
-                TemporalResidualBlock(d_model, dilation, dropout=cfg.model.dropout)
-                for dilation in [1, 2, 4, 8, 16, 32, 64]
-            ]
-        )
+
         # This is the actual refinement. Using everything we learned about the note, onsets, and offsets, we refine our original guess and concat them. 
         self.frame_delta = nn.Conv2d(
             d_model,
@@ -328,16 +385,24 @@ class PianoTranscriber(nn.Module):
         h = self.freq_reduce(h)
         h = self.trunk_post(h)
         h = self.attn(h)
+        h = self.gru(h)
     
+        pedal_features = h.mean(dim=3)  # (B, d_model, T)
+        pedal_logit = self.pedal_head(pedal_features)  # (B, 1, T)
+        pedal_prob = torch.sigmoid(pedal_logit)
+        pedal_map = pedal_prob.unsqueeze(-1).expand(-1, -1, -1, h.shape[-1])
+
         # Initial activity prediction. It's a guess that gets refined later. This is important because the model needs to have a rough idea of where notes are before it can predict onsets and offsets.
         frame_seed = self.note_conv(h)
 
-        # Add to our trunk output which results in a (B, d_model + 1, T, 88) tensor. 
-        event_input = torch.cat([h, frame_seed], dim=1) # frame_seed gets concat SECOND so the model knows that the last channel will always have some saucy prediction information
+        # The onset head intentionally receives no pedal context.
+        onset_input = torch.cat([h, frame_seed], dim=1)
+        onset_logit = self.onset_conv(onset_input)
 
-        # Now separately predict onsets and offests
-        onset_logit = self.onset_conv(event_input)
-        offset_logit = self.offset_conv(event_input)
+        # Offset can use the predicted global pedal state, without sending its loss
+        # gradient back through the pedal head.
+        offset_input = torch.cat([h, frame_seed, pedal_map.detach()], dim=1)
+        offset_logit = self.offset_conv(offset_input)
     
         # detach logits so that active loss doesn't backprop through onset/offset predictions
         # they will use their own losses to learn
@@ -347,12 +412,12 @@ class PianoTranscriber(nn.Module):
                 frame_seed,
                 torch.sigmoid(onset_logit).detach(), #sigmoid to squash to a probability
                 torch.sigmoid(offset_logit).detach(),#sigmoid to squash to a probability
+                pedal_map.detach(),
             ],
             dim=1,
-        ) # should be (B, d_model + 3, T, 88)
+        ) # should be (B, d_model + 4, T, 88)
     
         refine = self.frame_refine_input(event_context)
-        refine = self.frame_refine_temporal(refine)
 
         # Refine our guess
         frame_logit = frame_seed + self.frame_delta(refine)
@@ -362,6 +427,4 @@ class PianoTranscriber(nn.Module):
             dim=1,
         )
         # Permute to (B, T, 88, 3) for loss calculation and evaluation
-        return logits.permute(0, 2, 3, 1)
-
-
+        return logits.permute(0, 2, 3, 1), pedal_logit

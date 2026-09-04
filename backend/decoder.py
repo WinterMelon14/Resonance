@@ -6,7 +6,8 @@ import subprocess
 from bisect import bisect_right
 from pathlib import Path
 from typing import Literal
-
+from itertools import groupby 
+from dataclasses import dataclass, replace
 import librosa
 import numpy as np
 import pandas as pd
@@ -32,7 +33,7 @@ DEFAULT_INFERENCE_BATCH_SIZE = 8
 
 # These functions are all straight out of the notebook
 def default_threshold_results_path(cfg: ExperimentConfig = CFG) -> Path:
-    return Path(cfg.paths.checkpoint_path).parent / "threshold_results.csv"
+    return Path(cfg.paths.checkpoint_path).parent / "threshold_results2.csv"
 
 
 def apply_best_decoder_thresholds(
@@ -42,8 +43,6 @@ def apply_best_decoder_thresholds(
     # Change cfg.decoder to the thresholds we found
     path = (
         default_threshold_results_path(cfg)
-        if threshold_results_path is None
-        else Path(threshold_results_path)
     )
     if not path.is_file():
         raise FileNotFoundError(
@@ -551,7 +550,7 @@ def predict_full_feature_matrix(
     blend_mode: Literal["uniform", "triangular"] = "triangular",
     device: torch.device | str = "cpu",
     n_pitches: int = CFG.feature.n_pitches,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     features = np.asarray(features, dtype=np.float32)
     if features.ndim != 2:
         raise ValueError(
@@ -573,6 +572,8 @@ def predict_full_feature_matrix(
         dtype=np.float32,
     )
     weight_sum = np.zeros((total_frames, 1, 1), dtype=np.float32)
+    pedal_probability_sum = np.zeros(total_frames, dtype=np.float32)
+    pedal_weight_sum = np.zeros(total_frames, dtype=np.float32)
 
     for batch_index in tqdm(
         range(0, len(starts), inference_batch_size),
@@ -590,18 +591,32 @@ def predict_full_feature_matrix(
             valid_lengths.append(valid)
 
         inputs = torch.from_numpy(batch).unsqueeze(1).to(device, non_blocking=True)
-        logits = model(inputs)
-        expected_shape = (
+        model_output = model(inputs)
+        if not isinstance(model_output, (tuple, list)) or len(model_output) != 2:
+            raise ValueError(
+                "Model must return (note_logits, pedal_logit); "
+                f"got {type(model_output).__name__}."
+            )
+        note_logits, pedal_logit = model_output
+        expected_note_shape = (
             len(batch_starts),
             chunk_frames,
             n_pitches,
             N_LABEL_CHANNELS,
         )
-        if tuple(logits.shape) != expected_shape:
+        expected_pedal_shape = (len(batch_starts), 1, chunk_frames)
+        if tuple(note_logits.shape) != expected_note_shape:
             raise ValueError(
-                f"Model returned {tuple(logits.shape)}; expected {expected_shape}."
+                f"Model returned note logits {tuple(note_logits.shape)}; "
+                f"expected {expected_note_shape}."
             )
-        batch_probabilities = torch.sigmoid(logits).cpu().numpy()
+        if tuple(pedal_logit.shape) != expected_pedal_shape:
+            raise ValueError(
+                f"Model returned pedal logits {tuple(pedal_logit.shape)}; "
+                f"expected {expected_pedal_shape}."
+            )
+        batch_probabilities = torch.sigmoid(note_logits).cpu().numpy()
+        batch_pedal_probabilities = torch.sigmoid(pedal_logit[:, 0]).cpu().numpy()
 
         for sample, (start, valid) in enumerate(zip(batch_starts, valid_lengths)):
             end = start + valid
@@ -610,15 +625,21 @@ def predict_full_feature_matrix(
                 batch_probabilities[sample, :valid] * local_weight
             )
             weight_sum[start:end] += local_weight
+            pedal_probability_sum[start:end] += (
+                batch_pedal_probabilities[sample, :valid] * blend[:valid]
+            )
+            pedal_weight_sum[start:end] += blend[:valid]
 
-    if np.any(weight_sum == 0):
+    if np.any(weight_sum == 0) or np.any(pedal_weight_sum == 0):
         raise RuntimeError("Internal chunk-planning error left frames uncovered.")
 
     probabilities = probability_sum / weight_sum
+    pedal_probability = pedal_probability_sum / pedal_weight_sum
     return (
         probabilities[..., CH_ACTIVE],
         probabilities[..., CH_ONSET],
         probabilities[..., CH_OFFSET],
+        pedal_probability,
     )
 
 
@@ -633,7 +654,7 @@ def transcribe_feature_matrix(
     blend_mode: Literal["uniform", "triangular"] = "triangular",
     device: torch.device | str = "cpu",
 ) -> dict:
-    active_prob, onset_prob, offset_prob = predict_full_feature_matrix(
+    active_prob, onset_prob, offset_prob, pedal_prob = predict_full_feature_matrix(
         model,
         features,
         chunk_frames=chunk_frames,
@@ -648,6 +669,8 @@ def transcribe_feature_matrix(
         "active_prob": active_prob,
         "onset_prob": onset_prob,
         "offset_prob": offset_prob,
+        "pedal_prob": pedal_prob,
+        "pedal": pedal_prob >= 0.5,
         **decoded,
     }
 

@@ -11,7 +11,7 @@ class PathConfig:
         BACKEND_DIR
         / "data"
         / "models"
-        / "piano_transcriber_epoch_22.pt"
+        / "piano_transcriber_test_gru2_pedal_epoch_20.pt"
     )
 
 
